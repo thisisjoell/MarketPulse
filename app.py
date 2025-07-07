@@ -1,13 +1,15 @@
-# MarketPulse — Day 4 (Sentiment trend + GPT summary)
+# MarketPulse — Day 5 (adds anomaly detector + mini-forecast)
 # -----------------------------------------------------------
-# • Multi-subreddit sentiment (Day 3)                     ✔
-# • Daily sentiment trend plot                            ✔
-# • GPT-4o/3.5 summary of top Reddit posts                ✔
+# • Multi-subreddit sentiment (Day 3)                      ✔
+# • Daily sentiment trend & GPT summary (Day 4)            ✔
+# • 🚨 Anomaly alert (sent ↑30 %, price ↓2 %)              ✔
+# • 🔮 Mini linear-regression forecast                     ✔
 # -----------------------------------------------------------
 
 import os
 from datetime import date, datetime, timedelta
 
+import numpy as np              # 🆕
 import pandas as pd
 import plotly.express as px
 import streamlit as st
@@ -15,6 +17,7 @@ import yfinance as yf
 from dotenv import load_dotenv
 import praw
 import openai
+from sklearn.linear_model import LinearRegression   # 🆕
 
 # ── sentiment engines ───────────────────────────────────────────
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
@@ -30,7 +33,7 @@ load_dotenv()
 st.set_page_config(page_title="MarketPulse", page_icon="📈", layout="wide")
 
 # ------------------------------------------------------------------
-# Sidebar
+# Sidebar (unchanged)
 # ------------------------------------------------------------------
 with st.sidebar:
     st.header("🔑 API Keys")
@@ -45,7 +48,6 @@ with st.sidebar:
     }.items():
         if v:
             os.environ[k] = v
-
 openai.api_key = os.getenv("OPENAI_API_KEY", "")
 
 # ------------------------------------------------------------------
@@ -57,7 +59,7 @@ col1, col2, col3 = st.columns([2, 2, 1.2])
 with col1:
     ticker = st.text_input("Ticker (Stock or Crypto)", value="AAPL").upper().strip()
 with col2:
-    default_start = date.today() - timedelta(days=30)
+    default_start = date.today() - timedelta(days=60)  # 60 d to feed the model
     date_range = st.date_input("Date range", value=(default_start, date.today()), max_value=date.today())
     start_date, end_date = (date_range if isinstance(date_range, tuple) else (date_range, date_range))
 with col3:
@@ -65,11 +67,11 @@ with col3:
 st.markdown("---")
 
 # ------------------------------------------------------------------
-# Price helpers
+# Price helpers (unchanged)
 # ------------------------------------------------------------------
 @st.cache_data(show_spinner=False)
 def get_price_df(sym: str, start: date, end: date) -> pd.DataFrame:
-    df = yf.download(sym, start=start, end=end, progress=False)
+    df = yf.download(sym, start=start, end=end, progress=False, auto_adjust=True)
     if df.empty:
         raise ValueError("No price data returned.")
     if isinstance(df.columns, pd.MultiIndex):
@@ -79,13 +81,15 @@ def get_price_df(sym: str, start: date, end: date) -> pd.DataFrame:
     return df
 
 def plot_price(df: pd.DataFrame, sym: str):
-    fig = px.line(df, x=df.index, y="Close", title=f"{sym} — closing price",
+    fig = px.line(df, x=df.index, y="Close",
+                  title=f"{sym} — closing price",
                   labels={"Close": "Price (USD)", "index": "Date"})
     fig.update_traces(line_width=2)
     st.plotly_chart(fig, use_container_width=True)
 
+
 # ------------------------------------------------------------------
-# Sentiment engines
+# Sentiment engines (unchanged)
 # ------------------------------------------------------------------
 HF_MODEL = "cardiffnlp/twitter-roberta-base-sentiment-latest"
 @st.cache_resource(show_spinner=False)
@@ -97,15 +101,7 @@ tokenizer, model = _load_roberta()
 vader = SentimentIntensityAnalyzer()
 
 def _prep(text: str) -> str:
-    out = []
-    for t in text.split():
-        if t.startswith("@") and len(t) > 1:
-            out.append("@user")
-        elif t.startswith("http"):
-            out.append("http")
-        else:
-            out.append(t)
-    return " ".join(out)
+    return " ".join("@user" if t.startswith("@") else "http" if t.startswith("http") else t for t in text.split())
 
 def _rob_score(text: str) -> float:
     encoded = tokenizer(_prep(text), return_tensors="pt", truncation=True, max_length=128)
@@ -121,55 +117,84 @@ def sentiment(text: str) -> float:
         return vader.polarity_scores(text)["compound"]
 
 # ------------------------------------------------------------------
-# Reddit fetch
+# Reddit fetch (unchanged)
 # ------------------------------------------------------------------
 SUBREDDITS = [
     "stocks", "wallstreetbets", "investing", "options",
     "cryptocurrency", "pennystocks", "news", "technology",
 ]
 
-@st.cache_data(show_spinner=False, ttl=60*30)
-def fetch_reddit_df(sym: str) -> pd.DataFrame:
+
+@st.cache_data(show_spinner=False, ttl=60 * 30)
+def fetch_reddit_df(sym: str, start_date: date, end_date: date) -> pd.DataFrame:
     if not (os.getenv("REDDIT_CLIENT_ID") and os.getenv("REDDIT_CLIENT_SECRET")):
         raise RuntimeError("Reddit API keys not set.")
+
     reddit = praw.Reddit(
         client_id=os.getenv("REDDIT_CLIENT_ID"),
         client_secret=os.getenv("REDDIT_CLIENT_SECRET"),
-        user_agent="MarketPulse/0.3",
+        user_agent="MarketPulse/0.5",
     )
+
     def grab(sub):
-        q = f'"{sym}"'
-        return reddit.subreddit(sub).search(q, sort="new", limit=50, time_filter="week")
+        return reddit.subreddit(sub).search(
+            f'"{sym}"', sort="top", limit=100, time_filter="year"
+        )
 
     seen, recs = set(), []
     for sub in SUBREDDITS:
         for p in grab(sub):
+            post_dt = datetime.fromtimestamp(p.created_utc)
+            if not (start_date <= post_dt.date() <= end_date):
+                continue
             if p.id in seen:
                 continue
             seen.add(p.id)
             text = f"{p.title}\n{p.selftext or ''}"
             recs.append({
                 "id": p.id,
-                "created": datetime.fromtimestamp(p.created_utc),
+                "created": post_dt,
                 "sub": p.subreddit.display_name,
                 "upvotes": p.score,
                 "title": p.title,
-                "sentiment": sentiment(text),
                 "body": p.selftext or "",
                 "permalink": f"https://reddit.com{p.permalink}",
+                "sentiment": sentiment(text),
             })
     return pd.DataFrame(recs).sort_values("created", ascending=False)
-
 # ------------------------------------------------------------------
-# GPT summary
+# GPT summary (unchanged)
+# --- Hybrid scorer for GPT post selection ---------------------------------
+def top_posts_hybrid(df: pd.DataFrame, k: int = 10, tau_hrs: float = 72) -> pd.DataFrame:
+    """
+    Return k rows scored on upvotes + recency.
+    tau_hrs controls how fast recency weight decays
+    (≈72 hrs → 50 % weight drop every 3 days).
+    """
+    if df.empty:
+        return df
+
+    # Normalized upvotes (0–1)
+    up_norm = df["upvotes"].clip(lower=0)
+    up_norm = up_norm / up_norm.max() if up_norm.max() else up_norm
+
+    # Recency weight (exp decay)
+    age_hrs = (pd.Timestamp.utcnow() - df["created"]).dt.total_seconds() / 3600
+    rec_w   = np.exp(-age_hrs / tau_hrs)
+
+    # Hybrid score
+    df = df.copy()
+    df["score_hybrid"] = 0.6 * up_norm + 0.4 * rec_w
+
+    return df.sort_values("score_hybrid", ascending=False).head(k)
+
 # ------------------------------------------------------------------
 @st.cache_data(show_spinner=False, ttl=60*30)
 def gpt_summary(sym: str, top_posts: pd.DataFrame) -> str:
     if not openai.api_key:
         return "⚠️ No OpenAI key provided."
     posts_text = "\n\n".join(
-        [f"{i+1}. {r['title']} (▲{r['upvotes']}): {r['body'][:300]}"  # 300 chars cap
-         for i, r in top_posts.iterrows()]
+        [f"{i+1}. {r['title']} (▲{r['upvotes']}): {r['body'][:300]}" for i, r in top_posts.iterrows()]
     )
     prompt = (
         f"You are a financial analyst. Summarize the overall market sentiment for {sym} "
@@ -188,68 +213,157 @@ def gpt_summary(sym: str, top_posts: pd.DataFrame) -> str:
         return f"⚠️ GPT error: {e}"
 
 # ------------------------------------------------------------------
-# Display helpers
+# Display helpers (unchanged + one util at bottom)
 # ------------------------------------------------------------------
 def sentiment_color(v):
-    if v > 0.05:
-        return "background-color:#d4f4dd"
-    if v < -0.05:
-        return "background-color:#f8d7da"
+    if v > 0.05:  return "background-color:#d4f4dd"
+    if v < -0.05: return "background-color:#f8d7da"
     return "background-color:#f0f0f0"
 
 def show_table(df: pd.DataFrame):
     styled = (
         df[["created", "sub", "upvotes", "sentiment", "title"]]
         .head(20)
-        .style.map(sentiment_color, subset=["sentiment"])
+        .style.applymap(sentiment_color, subset=["sentiment"])
         .format({"sentiment": "{:.2f}", "created": lambda d: d.strftime('%Y-%m-%d %H:%M')})
     )
     st.dataframe(styled, use_container_width=True, hide_index=True)
 
 def show_dist(df: pd.DataFrame):
-    hist = px.histogram(df, x="sentiment", nbins=20,
-                        title="Sentiment distribution (compound score)")
-    hist.update_layout(margin=dict(l=0, r=0, t=40, b=0))
-    st.plotly_chart(hist, use_container_width=True)
+    st.plotly_chart(
+        px.histogram(df, x="sentiment", nbins=20,
+                     title="Sentiment distribution (compound score)")
+        .update_layout(margin=dict(l=0, r=0, t=40, b=0)),
+        use_container_width=True,
+    )
 
-def show_trend(df: pd.DataFrame):
-    daily = df.copy()
-    daily["day"] = daily["created"].dt.date
-    trend = daily.groupby("day")["sentiment"].mean().reset_index()
-    fig = px.line(trend, x="day", y="sentiment", markers=True,
-                  title="Daily average Reddit sentiment")
-    fig.update_traces(line_width=2)
-    fig.update_layout(margin=dict(l=0, r=0, t=40, b=0))
-    st.plotly_chart(fig, use_container_width=True)
+def show_trend(tr):
+    st.plotly_chart(
+        px.line(tr, x="day", y="sentiment", markers=True,
+                title="Daily average Reddit sentiment")
+        .update_traces(line_width=2)
+        .update_layout(margin=dict(l=0, r=0, t=40, b=0)),
+        use_container_width=True,
+    )
 
 # ------------------------------------------------------------------
 # Main orchestration
 # ------------------------------------------------------------------
 if fetch_btn:
     try:
-        # price
+        # ========== PRICE ==========
         df_price = get_price_df(ticker, start_date, end_date + timedelta(days=1))
         st.success(f"Price rows: {len(df_price):,}")
         plot_price(df_price, ticker)
 
-        # sentiment
-        df_posts = fetch_reddit_df(ticker)
+        # ========== SENTIMENT POSTS ==========
+        df_posts = fetch_reddit_df(ticker, start_date, end_date)
         if df_posts.empty:
             st.warning("No Reddit posts found for that ticker.")
             st.stop()
 
-        # GPT summary – sidebar
+        # ========== GPT SUMMARY ==========
         with st.sidebar:
             st.subheader("📢 Reddit Summary")
-            top10 = df_posts.sort_values("upvotes", ascending=False).head(10)
+            top10 = top_posts_hybrid(df_posts, k=10, tau_hrs=72)
             with st.spinner("Generating summary..."):
-                summary = gpt_summary(ticker, top10)
-            st.write(summary)
+                st.write(gpt_summary(ticker, top10))
 
+        # ---------- Daily sentiment ----------
+        df_posts["day"] = df_posts["created"].dt.date
+        trend = df_posts.groupby("day")["sentiment"].mean().reset_index()
+
+        # ---------- Daily price % change ----------
+        price_daily = df_price["Close"].resample("1D").last().dropna()
+        price_pct = price_daily.pct_change()
+        trend["pct_next"] = price_pct.shift(-1).reindex(trend["day"]).values
+
+        # ========== MINI FORECAST ==========
+        valid = trend.dropna(subset=["pct_next"])
+        if len(valid) >= 10:
+            X = valid[["sentiment"]].values
+            y = valid["pct_next"].values
+            lr = LinearRegression().fit(X, y)
+            pred_pct = float(lr.predict([[trend.iloc[-1]["sentiment"]]])[0])
+            st.metric(
+                "🔮 Forecast",
+                f"{pred_pct * 100:+.2f}%",
+                help="Predicted using linear regression on sentiment data",
+            )
+        else:
+            st.metric("🔮 Forecast", "n/a", help="Not enough history yet")
+
+        # ── 2️⃣  df_posts empty check (one-liner) ──────────────────────────────
+        if df_posts.empty:
+            st.warning("No Reddit posts found for that ticker.")
+            st.stop()
+
+
+        # ========== SMART ANOMALY DETECTORS =========================================
+        # helper – rolling correlation last N days, returns np.nan if not enough pts
+        def rolling_corr(series_a, series_b, win: int = 7):
+            """Pearson r over the last *win* non-NaN pairs; returns NaN if insufficient data."""
+            a_tail = series_a[-win:]
+            b_tail = series_b[-win:]
+            mask = ~np.isnan(a_tail) & ~np.isnan(b_tail)
+            if mask.sum() < win:
+                return np.nan
+            return np.corrcoef(a_tail[mask], b_tail[mask])[0, 1]
+
+        if len(trend) >= 2:
+            # --- today’s stats -------------------------------------------------------
+            sent_today = trend.iloc[-1]["sentiment"]
+            sent_prev = trend.iloc[-2]["sentiment"]
+            price_today = price_daily.iloc[-1]
+            price_prev = price_daily.iloc[-2]
+            pct_today = (price_today - price_prev) / price_prev if price_prev else 0.0
+
+            # rolling 30-day σ for z-score
+            roll_std = price_pct.rolling(30).std().iloc[-1]
+            z_score = pct_today / roll_std if roll_std else 0.0
+
+            # 7-day sentiment ↔ price correlation
+            corr7 = rolling_corr(trend["sentiment"].values, price_pct.values, 7)
+
+            # ------------------------------------------------------------------------
+            # NEGATIVE anomaly logic
+            neg_flags = 0
+            if z_score <= -1.5:  # ❶ price drop outlier
+                neg_flags += 1
+            if (sent_today - sent_prev) / (abs(sent_prev) or 1) >= 0.30:  # ❷ sentiment jump ≥30 %
+                neg_flags += 1
+            if sent_today > 0.05 and pct_today < -0.02:  # ❸ positive sentiment vs falling price
+                neg_flags += 1
+            if not np.isnan(corr7) and corr7 < -0.3:  # ➍ correlation break
+                neg_flags += 1
+
+            # POSITIVE anomaly logic
+            pos_flags = 0
+            if z_score >= 1.5:  # ❶ price surge outlier
+                pos_flags += 1
+            if sent_today < 0.05:  # ❷ sentiment still flat/neg
+                pos_flags += 1
+            if sent_today < sent_prev and pct_today > 0.02:  # ❸ bearish chatter vs rising price
+                pos_flags += 1
+            if not np.isnan(corr7) and corr7 < 0.1:  # ➍ correlation weakened/negative
+                pos_flags += 1
+
+            # Fire alerts when ≥2 triggers
+            if neg_flags >= 2:
+                st.warning(
+                    "🚨 **Divergence Detected:** Price dropped but sentiment remains optimistic "
+                    "(≥ 2 confirming signals)."
+                )
+            if pos_flags >= 2:
+                st.info(
+                    "📈 **Early Breakout Signal:** Price surged while sentiment is muted "
+                    "(≥ 2 confirming signals)."
+                )
+        # ========== VISUALS ==========
         st.subheader("🗣️ Latest Reddit chatter")
         show_table(df_posts)
         show_dist(df_posts)
-        show_trend(df_posts)
+        show_trend(trend)
 
     except Exception as err:
         st.error(f"⚠️ {err}")
@@ -259,5 +373,5 @@ if fetch_btn:
 # ------------------------------------------------------------------
 st.caption(
     "Data: Yahoo Finance & Reddit • Sentiment: RoBERTa+VADER • "
-    "GPT summary powered by OpenAI • Built with Streamlit — MarketPulse 2025"
+    "GPT summary • Forecast: LinearRegression • MarketPulse 2025"
 )
