@@ -24,6 +24,8 @@ from transformers import AutoTokenizer, AutoModelForSequenceClassification
 from scipy.special import softmax
 import torch
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+import alpha_lab
+import models
 # ────────────────────────────────────────────────────────────────
 
 # ------------------------------------------------------------------
@@ -87,7 +89,6 @@ def plot_price(df: pd.DataFrame, sym: str):
     fig.update_traces(line_width=2)
     st.plotly_chart(fig, use_container_width=True)
 
-
 # ------------------------------------------------------------------
 # Sentiment engines (unchanged)
 # ------------------------------------------------------------------
@@ -123,7 +124,6 @@ SUBREDDITS = [
     "stocks", "wallstreetbets", "investing", "options",
     "cryptocurrency", "pennystocks", "news", "technology",
 ]
-
 
 @st.cache_data(show_spinner=False, ttl=60 * 30)
 def fetch_reddit_df(sym: str, start_date: date, end_date: date) -> pd.DataFrame:
@@ -162,33 +162,23 @@ def fetch_reddit_df(sym: str, start_date: date, end_date: date) -> pd.DataFrame:
                 "sentiment": sentiment(text),
             })
     return pd.DataFrame(recs).sort_values("created", ascending=False)
+
 # ------------------------------------------------------------------
 # GPT summary (unchanged)
-# --- Hybrid scorer for GPT post selection ---------------------------------
+# ------------------------------------------------------------------
 def top_posts_hybrid(df: pd.DataFrame, k: int = 10, tau_hrs: float = 72) -> pd.DataFrame:
-    """
-    Return k rows scored on upvotes + recency.
-    tau_hrs controls how fast recency weight decays
-    (≈72 hrs → 50 % weight drop every 3 days).
-    """
     if df.empty:
         return df
-
-    # Normalized upvotes (0–1)
     up_norm = df["upvotes"].clip(lower=0)
     up_norm = up_norm / up_norm.max() if up_norm.max() else up_norm
-
-    # Recency weight (exp decay)
-    age_hrs = (pd.Timestamp.utcnow() - df["created"]).dt.total_seconds() / 3600
+    now_naive = pd.Timestamp.utcnow().tz_localize(None)
+    created_naive = pd.to_datetime(df["created"]).dt.tz_localize(None)
+    age_hrs = (now_naive - created_naive).dt.total_seconds() / 3600
     rec_w   = np.exp(-age_hrs / tau_hrs)
-
-    # Hybrid score
     df = df.copy()
     df["score_hybrid"] = 0.6 * up_norm + 0.4 * rec_w
-
     return df.sort_values("score_hybrid", ascending=False).head(k)
 
-# ------------------------------------------------------------------
 @st.cache_data(show_spinner=False, ttl=60*30)
 def gpt_summary(sym: str, top_posts: pd.DataFrame) -> str:
     if not openai.api_key:
@@ -213,7 +203,7 @@ def gpt_summary(sym: str, top_posts: pd.DataFrame) -> str:
         return f"⚠️ GPT error: {e}"
 
 # ------------------------------------------------------------------
-# Display helpers (unchanged + one util at bottom)
+# Display helpers (unchanged)
 # ------------------------------------------------------------------
 def sentiment_color(v):
     if v > 0.05:  return "background-color:#d4f4dd"
@@ -278,6 +268,10 @@ if fetch_btn:
         price_pct = price_daily.pct_change()
         trend["pct_next"] = price_pct.shift(-1).reindex(trend["day"]).values
 
+        # persist for Alpha Lab
+        st.session_state["price_daily"] = price_daily
+        st.session_state["trend"] = trend
+
         # ========== MINI FORECAST ==========
         valid = trend.dropna(subset=["pct_next"])
         if len(valid) >= 10:
@@ -293,16 +287,8 @@ if fetch_btn:
         else:
             st.metric("🔮 Forecast", "n/a", help="Not enough history yet")
 
-        # ── 2️⃣  df_posts empty check (one-liner) ──────────────────────────────
-        if df_posts.empty:
-            st.warning("No Reddit posts found for that ticker.")
-            st.stop()
-
-
         # ========== SMART ANOMALY DETECTORS =========================================
-        # helper – rolling correlation last N days, returns np.nan if not enough pts
         def rolling_corr(series_a, series_b, win: int = 7):
-            """Pearson r over the last *win* non-NaN pairs; returns NaN if insufficient data."""
             a_tail = series_a[-win:]
             b_tail = series_b[-win:]
             mask = ~np.isnan(a_tail) & ~np.isnan(b_tail)
@@ -311,54 +297,42 @@ if fetch_btn:
             return np.corrcoef(a_tail[mask], b_tail[mask])[0, 1]
 
         if len(trend) >= 2:
-            # --- today’s stats -------------------------------------------------------
             sent_today = trend.iloc[-1]["sentiment"]
             sent_prev = trend.iloc[-2]["sentiment"]
             price_today = price_daily.iloc[-1]
             price_prev = price_daily.iloc[-2]
             pct_today = (price_today - price_prev) / price_prev if price_prev else 0.0
-
-            # rolling 30-day σ for z-score
             roll_std = price_pct.rolling(30).std().iloc[-1]
             z_score = pct_today / roll_std if roll_std else 0.0
-
-            # 7-day sentiment ↔ price correlation
             corr7 = rolling_corr(trend["sentiment"].values, price_pct.values, 7)
 
-            # ------------------------------------------------------------------------
-            # NEGATIVE anomaly logic
             neg_flags = 0
-            if z_score <= -1.5:  # ❶ price drop outlier
+            if z_score <= -1.5:
                 neg_flags += 1
-            if (sent_today - sent_prev) / (abs(sent_prev) or 1) >= 0.30:  # ❷ sentiment jump ≥30 %
+            if (sent_today - sent_prev) / (abs(sent_prev) or 1) >= 0.30:
                 neg_flags += 1
-            if sent_today > 0.05 and pct_today < -0.02:  # ❸ positive sentiment vs falling price
+            if sent_today > 0.05 and pct_today < -0.02:
                 neg_flags += 1
-            if not np.isnan(corr7) and corr7 < -0.3:  # ➍ correlation break
+            if not np.isnan(corr7) and corr7 < -0.3:
                 neg_flags += 1
 
-            # POSITIVE anomaly logic
             pos_flags = 0
-            if z_score >= 1.5:  # ❶ price surge outlier
+            if z_score >= 1.5:
                 pos_flags += 1
-            if sent_today < 0.05:  # ❷ sentiment still flat/neg
+            if sent_today < 0.05:
                 pos_flags += 1
-            if sent_today < sent_prev and pct_today > 0.02:  # ❸ bearish chatter vs rising price
+            if sent_today < sent_prev and pct_today > 0.02:
                 pos_flags += 1
-            if not np.isnan(corr7) and corr7 < 0.1:  # ➍ correlation weakened/negative
+            if not np.isnan(corr7) and corr7 < 0.1:
                 pos_flags += 1
 
-            # Fire alerts when ≥2 triggers
             if neg_flags >= 2:
-                st.warning(
-                    "🚨 **Divergence Detected:** Price dropped but sentiment remains optimistic "
-                    "(≥ 2 confirming signals)."
-                )
+                st.warning("🚨 **Divergence Detected:** Price dropped but sentiment remains optimistic "
+                           "(≥ 2 confirming signals).")
             if pos_flags >= 2:
-                st.info(
-                    "📈 **Early Breakout Signal:** Price surged while sentiment is muted "
-                    "(≥ 2 confirming signals)."
-                )
+                st.info("📈 **Early Breakout Signal:** Price surged while sentiment is muted "
+                        "(≥ 2 confirming signals).")
+
         # ========== VISUALS ==========
         st.subheader("🗣️ Latest Reddit chatter")
         show_table(df_posts)
@@ -367,6 +341,67 @@ if fetch_btn:
 
     except Exception as err:
         st.error(f"⚠️ {err}")
+
+# ------------------------------------------------------------------
+# 🧠 Alpha Lab – strategy simulator (always visible)
+# ------------------------------------------------------------------
+# ------------------------------------------------------------------
+# 🧠 Alpha Lab — Strategy Simulator
+# ------------------------------------------------------------------
+with st.expander("🧠 Alpha Lab — Strategy Simulator"):
+    tab_manual, tab_model = st.tabs(["Manual rules", "Model signal"])
+
+    # ---------- Manual rules tab ----------
+    with tab_manual:
+        s_thr   = st.slider("Sentiment threshold", 0.00, 1.00, 0.05, 0.01)
+        p_drop  = st.slider("Price drop %",  0.0, 10.0, 2.0, 0.25) / 100
+        p_rise  = st.slider("Price rise %",  0.0, 10.0, 5.0, 0.25) / 100
+        stop_ls = st.slider("Stop-loss %",   0.0, 20.0, 0.0, 0.5) / 100
+
+        if st.button("Run manual back-test"):
+            price_daily = st.session_state.get("price_daily")
+            trend       = st.session_state.get("trend")
+            if price_daily is None:
+                st.warning("Run the main fetch first.")
+            else:
+                merged = alpha_lab.merge_price_sentiment(price_daily, trend)
+                eq, trades = alpha_lab.run_manual_strategy(
+                    merged, s_thr, p_drop, p_rise, stop_loss_pct=stop_ls
+                )
+                alpha_lab.show_results(eq, trades)
+
+    # ---------- Model signal tab ----------
+    with tab_model:
+        model_type = st.selectbox("Model", ["Bayesian", "ARIMA", "Prophet"])
+        thresh = st.slider("Probability / forecast threshold", 0.50, 0.90, 0.70, 0.01)
+        if st.button("Train model & back-test"):
+            price_daily = st.session_state.get("price_daily")
+            trend       = st.session_state.get("trend")
+            if price_daily is None:
+                st.warning("Run the main fetch first.")
+            else:
+                merged = alpha_lab.merge_price_sentiment(price_daily, trend)
+
+                if model_type == "Bayesian":
+                    mdl = models.train_bayes(merged)
+                    eq, trades = alpha_lab.run_model_strategy_bayes(
+                        merged, mdl, prob_thresh=thresh
+                    )
+                elif model_type == "ARIMA":
+                    mdl = models.train_arima(merged)
+                    eq, trades = alpha_lab.run_model_strategy_arima(
+                        merged, mdl, ret_thresh=(thresh - 0.5) / 10  # ≈ ±0.02
+                    )
+                else:  # Prophet
+                    mdl = models.train_prophet(merged)
+                    next_day = merged.index[-1] + pd.Timedelta(days=1)
+                    eq, trades = alpha_lab.run_model_strategy_prophet(
+                        merged, mdl, next_day, ret_thresh=(thresh - 0.5) / 10
+                    )
+
+                alpha_lab.show_results(eq, trades)
+
+
 
 # ------------------------------------------------------------------
 # Footer
