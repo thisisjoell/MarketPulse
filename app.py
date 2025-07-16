@@ -163,6 +163,33 @@ def fetch_reddit_df(sym: str, start_date: date, end_date: date) -> pd.DataFrame:
             })
     return pd.DataFrame(recs).sort_values("created", ascending=False)
 
+# ────────────────────────────────────────────────────────────
+# Helper: price + sentiment fetch  (cached for 1 hour)
+# ────────────────────────────────────────────────────────────
+@st.cache_data(show_spinner=False, ttl=60 * 60)  # 60 min = 3 600 s
+def fetch_price_and_trend(
+    sym: str,
+    start: date,
+    end: date,
+) -> tuple[pd.Series, pd.DataFrame]:
+    """
+    Cached fetch so multi-ticker benchmarks don’t hammer the APIs.
+
+    Returns
+    -------
+    price_daily : Series           adjusted close, DatetimeIndex
+    trend_df    : DataFrame        ['day', 'sentiment']
+    """
+    # --- price --------------------------------------------------
+    price_daily = get_price_df(sym, start, end + timedelta(days=1))["Close"]
+
+    # --- sentiment ---------------------------------------------
+    posts = fetch_reddit_df(sym, start, end)
+    posts["day"] = posts["created"].dt.date
+    trend_df = posts.groupby("day")["sentiment"].mean().reset_index()
+
+    return price_daily, trend_df
+
 # ------------------------------------------------------------------
 # GPT summary (unchanged)
 # ------------------------------------------------------------------
@@ -345,18 +372,21 @@ if fetch_btn:
 # ------------------------------------------------------------------
 # 🧠 Alpha Lab – strategy simulator (always visible)
 # ------------------------------------------------------------------
-# ------------------------------------------------------------------
-# 🧠 Alpha Lab — Strategy Simulator
-# ------------------------------------------------------------------
 with st.expander("🧠 Alpha Lab — Strategy Simulator"):
     tab_manual, tab_model = st.tabs(["Manual rules", "Model signal"])
-
     # ---------- Manual rules tab ----------
     with tab_manual:
-        s_thr   = st.slider("Sentiment threshold", 0.00, 1.00, 0.05, 0.01)
-        p_drop  = st.slider("Price drop %",  0.0, 10.0, 2.0, 0.25) / 100
-        p_rise  = st.slider("Price rise %",  0.0, 10.0, 5.0, 0.25) / 100
-        stop_ls = st.slider("Stop-loss %",   0.0, 20.0, 0.0, 0.5) / 100
+        # ── manual-rules sliders ─────────────────────────────────────────
+        s_thr = st.slider("Sentiment >", 0.00, 1.00, 0.05, 0.01)  # 0.01 step
+        p_drop = st.slider("Price drop % ≥", 0.0, 10.0, 2.0, 0.10) / 100  # 0.10 % step
+        p_rise = st.slider("Take-profit % ≥", 0.0, 10.0, 5.0, 0.10) / 100  # 0.10 % step
+        vol_th = st.slider("Volatility spike >", 0.0, 5.0, 1.5, 0.10) / 100  # 0.10 % step
+        mom_th = st.slider("Bear momentum % <", 0.0, 5.0, 1.0, 0.10) / 100  # 0.10 % step
+        tx_bps = st.slider("Tx-cost (bps), per side", 0, 50, 5, 1)  # 1 bp step
+        stop_ls = st.slider("Stop-loss %", 0.0, 20.0, 0.0, 0.50) / 100  # 0.50 % step
+        # ── NEW technical-indicator guards ────────────────────────────
+        rsi_max = st.slider("RSI ≤", 10, 70, 30, 1)  # oversold filter
+        use_macd = st.checkbox("Require MACD histogram > 0", value=False)
 
         if st.button("Run manual back-test"):
             price_daily = st.session_state.get("price_daily")
@@ -366,42 +396,193 @@ with st.expander("🧠 Alpha Lab — Strategy Simulator"):
             else:
                 merged = alpha_lab.merge_price_sentiment(price_daily, trend)
                 eq, trades = alpha_lab.run_manual_strategy(
-                    merged, s_thr, p_drop, p_rise, stop_loss_pct=stop_ls
+                    merged,
+                    s_thr, p_drop, p_rise,
+                    vol_thresh=vol_th,
+                    mom_thresh=mom_th,
+                    rsi_max=rsi_max,  # ▶ forward
+                    macd_req=use_macd,  # ▶ forward
+                    stop_loss_pct=stop_ls,
+                    tx_cost_bps=tx_bps,
                 )
                 alpha_lab.show_results(eq, trades)
+    with st.expander("🔧 Hyper-parameter grid search"):
+        if st.button("Run grid on current ticker"):
+            price_daily = st.session_state.get("price_daily")
+            trend = st.session_state.get("trend")
+            if price_daily is None:
+                st.info("Run **Fetch Data & Sentiment** first.")
+                st.stop()
+
+            merged = alpha_lab.merge_price_sentiment(price_daily, trend)
+
+            grid = {
+                "sent_threshold": [0.02, 0.05, 0.10],
+                "price_drop_pct": [0.01, 0.02],
+                "price_rise_pct": [0.03, 0.05],  # required
+                "vol_thresh": [0.01, 0.015],
+                #"tx_cost_bps": [0, 5],
+            }
+
+            # SINGLE call — no extra loop, no extra progress bar
+            res = alpha_lab.grid_search(
+                merged,
+                grid,
+                lambda d, **k: alpha_lab.run_manual_strategy(d, **k),
+                base_kwargs=dict(  # keep these fixed
+                    mom_thresh=mom_th,
+                    stop_loss_pct=stop_ls,
+                    tx_cost_bps=tx_bps,
+                )
+            )
+            st.dataframe(res, use_container_width=True)
+
+    with st.expander("📊 Multi-ticker benchmark"):
+        tickers_str = st.text_input("Tickers (comma)", "AAPL, TSLA, NVDA")
+        if st.button("Run across tickers"):
+            tick_list = [x.strip().upper() for x in tickers_str.split(",") if x.strip()]
+
+            df_sum = alpha_lab.batch_benchmark(
+                tick_list,
+                lambda sym: fetch_price_and_trend(sym, start_date, end_date),
+                alpha_lab.merge_price_sentiment,
+                alpha_lab.run_manual_strategy,
+                sent_threshold=s_thr,
+                price_drop_pct=p_drop,
+                price_rise_pct=p_rise,
+                vol_thresh=vol_th,
+                mom_thresh=mom_th,
+
+                # NEW – pass the two extra guards
+                rsi_max=rsi_max,
+                macd_req=use_macd,
+
+                stop_loss_pct=stop_ls,
+                tx_cost_bps=tx_bps,
+            )
+            st.dataframe(df_sum, use_container_width=True)
+    # ------------------------------------------------------------------
+    # 🧩 Correlation analysis
+    # ------------------------------------------------------------------
+    with st.expander("🔗 Cross-asset correlation analysis"):
+        tick_sel = st.text_input("Tickers to analyse (comma)",
+                                 "AAPL, TSLA, NVDA, BTC-USD")
+        mode = st.selectbox("Correlation of …",
+                            ["Price returns", "Manual-strategy equity"])
+        win_days = st.slider("Rolling window (days)", 10, 120, 30, 5)
+
+        if st.button("Compute correlations"):
+            syms = [x.strip().upper() for x in tick_sel.split(",") if x.strip()]
+            if len(syms) < 2:
+                st.warning("Need at least two tickers.")
+                st.stop()
+
+            price_map, eq_map = {}, {}
+
+            # ▶▶ NEW wrapper — one spinner for the whole job
+            with st.spinner("Running back-tests and correlations …"):
+                bar = st.progress(0.0, text="Fetching …")
+
+                for i, s in enumerate(syms, start=1):
+                    # —— (1) pull prices ——————————————
+                    try:
+                        price_map[s] = get_price_df(
+                            s, start_date, end_date + timedelta(1)
+                        )["Close"]
+                    except Exception as e:
+                        st.error(f"{s}: {e}")
+                        st.stop()
+
+                    # —— (2) optional strategy equity ————
+                    if mode == "Manual-strategy equity":
+                        price, trend = fetch_price_and_trend(s, start_date, end_date)
+                        merged = alpha_lab.merge_price_sentiment(price, trend)
+                        eq, _ = alpha_lab.run_manual_strategy(
+                            merged,
+                            sent_threshold=s_thr,
+                            price_drop_pct=p_drop,
+                            price_rise_pct=p_rise,
+                            vol_thresh=vol_th,
+                            mom_thresh=mom_th,
+                            rsi_max=rsi_max,
+                            macd_req=use_macd,
+                            stop_loss_pct=stop_ls,
+                            tx_cost_bps=tx_bps,
+                        )
+                        eq_map[s] = eq["equity"]
+
+                    bar.progress(i / len(syms))
+
+                bar.empty()  # 🧹 tidy up the progress bar
+
+            # —— build matrix + heat-map ——————————————
+            if mode == "Price returns":
+                corr_df = alpha_lab.corr_matrix(price_map)
+            else:
+                corr_df = alpha_lab.corr_matrix(eq_map)
+
+            alpha_lab.plot_corr_heat(corr_df)
+
+            # —— rolling ρ plots (always based on returns) ———
+            st.subheader("Rolling correlations")
+            for i in range(len(syms) - 1):
+                for j in range(i + 1, len(syms)):
+                    if mode == "Price returns":
+                        a, b = price_map[syms[i]], price_map[syms[j]]
+                    else:
+                        a, b = eq_map[syms[i]], eq_map[syms[j]]
+
+                    rho = alpha_lab.rolling_corr_pair(a, b, win=win_days)
+                    alpha_lab.plot_rolling_corr(rho, syms[i], syms[j])
 
     # ---------- Model signal tab ----------
     with tab_model:
         model_type = st.selectbox("Model", ["Bayesian", "ARIMA", "Prophet"])
         thresh = st.slider("Probability / forecast threshold", 0.50, 0.90, 0.70, 0.01)
+        # NEW ▶ choose single-fit or 5-fold walk-forward
+        use_cv = st.checkbox("Walk-forward CV (5 folds)", value=False)
         if st.button("Train model & back-test"):
             price_daily = st.session_state.get("price_daily")
-            trend       = st.session_state.get("trend")
+            trend = st.session_state.get("trend")
             if price_daily is None:
                 st.warning("Run the main fetch first.")
+                st.stop()
+
+            merged = alpha_lab.merge_price_sentiment(price_daily, trend)
+
+            # ----- map selection → callables ----------------------------------
+            if model_type == "Bayesian":
+                train_fn = models.train_bayes
+                strat_fn = lambda df_slice, mdl: alpha_lab.run_model_strategy_bayes(
+                    df_slice, mdl, prob_thresh=thresh
+                )
+
+            elif model_type == "ARIMA":
+                train_fn = models.train_arima
+                strat_fn = lambda df_slice, mdl: alpha_lab.run_model_strategy_arima(
+                    df_slice, mdl, ret_thresh=(thresh - 0.5) / 10
+                )
+
+            else:  # Prophet
+                train_fn = models.train_prophet
+                strat_fn = lambda df_slice, mdl: alpha_lab.run_model_strategy_prophet(
+                    df_slice,
+                    mdl,
+                    df_slice.index[-1] + pd.Timedelta(days=1),
+                    ret_thresh=(thresh - 0.5) / 10,
+                )
+
+            # ----- single fit vs walk-forward ---------------------------------
+            if use_cv:
+                with st.spinner("Running walk-forward CV…"):
+                    eq, trades = alpha_lab.walk_forward_backtest(
+                        merged, train_fn, strat_fn
+                    )
             else:
-                merged = alpha_lab.merge_price_sentiment(price_daily, trend)
+                mdl = train_fn(merged)  # fit on the full window
+                eq, trades = strat_fn(merged, mdl)
 
-                if model_type == "Bayesian":
-                    mdl = models.train_bayes(merged)
-                    eq, trades = alpha_lab.run_model_strategy_bayes(
-                        merged, mdl, prob_thresh=thresh
-                    )
-                elif model_type == "ARIMA":
-                    mdl = models.train_arima(merged)
-                    eq, trades = alpha_lab.run_model_strategy_arima(
-                        merged, mdl, ret_thresh=(thresh - 0.5) / 10  # ≈ ±0.02
-                    )
-                else:  # Prophet
-                    mdl = models.train_prophet(merged)
-                    next_day = merged.index[-1] + pd.Timedelta(days=1)
-                    eq, trades = alpha_lab.run_model_strategy_prophet(
-                        merged, mdl, next_day, ret_thresh=(thresh - 0.5) / 10
-                    )
-
-                alpha_lab.show_results(eq, trades)
-
-
+            alpha_lab.show_results(eq, trades)
 
 # ------------------------------------------------------------------
 # Footer
