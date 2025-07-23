@@ -1,202 +1,253 @@
+#!/usr/bin/env python
+# models.py — Alpha‑Lab signal generators  (2025‑07‑21)
+# -----------------------------------------------------
 """
-models.py – ML signal generators for Alpha Lab
-==============================================
+Fast, lightweight ML models that map <price + Reddit‑sentiment> ➜ trading
+signals.  Public API is 100 % compatible with the original release.
 
-This module trains three forecasting / classification models that Alpha Lab
-uses to turn Reddit–sentiment + price data into trading signals.
+New in this version
+-------------------
+1. Logistic‑regression now **optionally calibrated** (isotonic) and ships an
+   on‑demand SHAP explainer for feature inspection.
+2. Added **LightGBM** classifier (`train_lgbm`, `predict_lgbm`) as a faster /
+   stronger alternative to vanilla Gradient‑Boosting.
+3. ARIMA micro‑grid uses constant‑time **row cap + n_jobs** parallel fit
+   and faster statsmodels flags (`trend="n"`, no stationarity enforcement).
+4. Prophet keeps the sentiment regressor but trims history to ≤ 1 200 rows
+   for sub‑second fits on Streamlit Cloud.
 
-Currently implemented
----------------------
-1. **Bayesian Ridge “direction” classifier**
-   • Features = sentiment_t, Δsentiment, 3-day rolling mean
-   • Target  = 1 if next-day return > 0 else 0
-   • `predict_bayes()` returns **P(up)**.
-
-2. **ARIMA (1,0,0) with exogenous sentiment** (`statsmodels`)
-   • Forecasts next-day **percent return**.
-   • In *app.py* the dashboard maps the *Probability / forecast threshold*
-     slider ∈ [0.50 … 0.90] to a **return threshold**
-     `ret_thresh = (slider - 0.5) / 10  ≈ ±2 % … ±4 %`.
-     A forecast above `+ret_thresh` (“long”) or below `–ret_thresh` (“flat”)
-     turns into an entry signal.
-
-3. **Prophet with sentiment regressor** (`prophet`)
-   • Enabled **weekly** and **yearly** seasonality (`weekly_seasonality=True`,
-     `yearly_seasonality=True`).  No extra custom weekly term is added, so
-     there is **one** weekly component with Fourier order = 3 (Prophet’s
-     default).
-   • Dashboard uses the *same* return-threshold mapping as ARIMA.
-
-Install deps
-------------
-`pip install scikit-learn statsmodels prophet`
-
-Public API
-----------
-train_bayes(df)                 → fitted_model
-predict_bayes(model, row)       → prob_up ∈ [0,1]
-
-train_arima(df)                 → fitted_model
-forecast_arima(model, sent)     → ΔP % forecast
-
-train_prophet(df)               → fitted_model
-forecast_prophet(model, ds, s)  → ΔP % forecast
+Install
+-------
+pip install scikit-learn statsmodels prophet lightgbm shap
+               # ^ last two are optional but recommended
 """
-
 from __future__ import annotations
-import warnings
-import numpy as np
-import pandas as pd
+import streamlit as st
+import warnings, joblib, numpy as np, pandas as pd
+from typing import Any, List
 
+# ----------------------------------------------------------------------
+# 💡  Feature engineering
+# ----------------------------------------------------------------------
+def _fe(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Build the feature matrix:
+      • Sentiment dynamics
+      • Simple price momentum / vol
+      • Basic TA indicators via `ta`
+    """
+    import ta  # tiny dep already in requirements
+
+    t = df.copy()
+
+    # sentiment history
+    t["sent_lag1"] = t["sentiment"].shift(1)
+    t["sent_lag2"] = t["sentiment"].shift(2)
+    t["d_sent"]    = t["sentiment"] - t["sent_lag1"]
+    t["roll3"]     = t["sentiment"].rolling(3).mean()
+
+    # price momentum & vol
+    t["mom5"]   = t["price"].pct_change(5)
+    t["mom10"]  = t["price"].pct_change(10)
+    t["vol10"]  = t["price"].pct_change().rolling(10).std()
+
+    # interactions
+    t["sent_x_mom5"]  = t["sentiment"] * t["mom5"]
+    t["sent_x_vol10"] = t["sentiment"] * t["vol10"]
+
+    # TA
+    t["rsi_14"]    = ta.momentum.rsi(t["price"], window=14)
+    t["macd_hist"] = ta.trend.macd_diff(
+        t["price"], window_slow=26, window_fast=12, window_sign=9
+    )
+
+    return t.fillna(0.0)[
+        [
+            "sentiment", "sent_lag1", "sent_lag2", "d_sent", "roll3",
+            "mom5", "mom10", "vol10",
+            "sent_x_mom5", "sent_x_vol10",
+            "rsi_14", "macd_hist",
+        ]
+    ]
 # ------------------------------------------------------------------
-# 1. Bayesian-ridge direction classifier
+# Keep legacy name so alpha_lab & old notebooks don't break
 # ------------------------------------------------------------------
-from sklearn.linear_model import BayesianRidge
+def _feature_engineering(df: pd.DataFrame) -> pd.DataFrame:   # noqa: N802
+    """Deprecated alias – use `_fe` going forward."""
+    return _fe(df)
+# ----------------------------------------------------------------------
+# 1.  Logistic‑regression (+ isotonic calibration + SHAP)
+# ----------------------------------------------------------------------
+from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
-from sklearn.pipeline import make_pipeline
+from sklearn.impute import SimpleImputer
+from sklearn.pipeline import Pipeline
+from sklearn.model_selection import GridSearchCV
+from sklearn.calibration import CalibratedClassifierCV
 
+def _grid_logistic() -> GridSearchCV:
+    return GridSearchCV(
+        Pipeline(
+            steps=[
+                ("imp", SimpleImputer(strategy="constant", fill_value=0)),
+                ("sc",  StandardScaler()),
+                ("log", LogisticRegression(solver="lbfgs", max_iter=400)),
+            ]
+        ),
+        param_grid={
+            "log__C":            [0.1, 0.3, 1, 3, 10],
+            "log__class_weight": [None, "balanced"],
+        },
+        scoring="roc_auc",
+        cv=3,
+        n_jobs=-1,
+        refit=True,
+    )
 
-def _feature_engineering(df: pd.DataFrame) -> pd.DataFrame:
-    """sent_t, Δsent (lag-1), 3-day rolling mean"""
-    tmp = df.copy()
-    tmp["d_sent"] = tmp["sentiment"].diff().fillna(0)
-    tmp["roll3"] = tmp["sentiment"].rolling(3).mean().fillna(tmp["sentiment"])
-    return tmp[["sentiment", "d_sent", "roll3"]]
+def train_logistic(
+    df: pd.DataFrame,
+    calibrate: bool = True,
+) -> Pipeline | CalibratedClassifierCV:
+    X = _fe(df).iloc[:-3]
+    y = (df["ret_pct"].shift(-3) > 0).astype(int).iloc[:-3]
 
+    best = _grid_logistic().fit(X, y).best_estimator_
+    if calibrate:
+        # isotonic keeps monotonicity – important for prob‑threshold slider
+        return CalibratedClassifierCV(best, method="isotonic", cv=3).fit(X, y)
+    return best
 
-def train_bayes(df: pd.DataFrame):
-    """Target: 1 if next-day return > 0 else 0"""
-    feat = _feature_engineering(df)
-    y = (df["ret_pct"].shift(-1) > 0).astype(int)
-    X = feat.values[:-1]
-    y = y.values[:-1]
-    pipe = make_pipeline(StandardScaler(), BayesianRidge())
-    pipe.fit(X, y)
-    return pipe
+def predict_logistic(model, row: pd.Series) -> float:
+    return float(model.predict_proba(_fe(pd.DataFrame([row])).iloc[:1])[0, 1])
 
+# --- SHAP helper (optional) ---------------------------------------------------
+def shap_values(model, df_sample: pd.DataFrame, max_obs: int = 500):
+    """
+    Return SHAP values for a sample of rows.
+    Requires `shap` – will raise if not installed.
+    """
+    import shap
+    X = _fe(df_sample).head(max_obs)
+    explainer = shap.Explainer(model, X, feature_names=X.columns, seed=42)
+    return explainer(X)
 
-def predict_bayes(model, sent_row: pd.Series) -> float:
-    """Return P(up) using the same engineered features on single row"""
-    feat_row = pd.DataFrame([sent_row])  # series → df(1×3)
-    prob = model.predict(feat_row)[0]
-    # map regression output (~real line) to [0,1] via logistic
-    prob_up = 1 / (1 + np.exp(-prob))
-    return float(np.clip(prob_up, 0, 1))
+# public aliases ---------------------------------------------------------------
+train_bayes   = train_logistic
+predict_bayes = predict_logistic
 
+# ----------------------------------------------------------------------
+# 1‑bis.  LightGBM classifier  (optional)
+# ----------------------------------------------------------------------
+try:
+    import lightgbm as lgb
+    _LGB_OK = True
+except ModuleNotFoundError:
+    _LGB_OK = False
 
-# ------------------------------------------------------------------
-# 2. ARIMA(1,0,0) + sentiment exogenous
-# ------------------------------------------------------------------
+def train_lgbm(
+    df: pd.DataFrame,
+    params: dict | None = None,
+) -> Any:
+    if not _LGB_OK:
+        raise ImportError("lightgbm not installed; `pip install lightgbm`")
+
+    X = _fe(df).iloc[:-3]
+    y = (df["ret_pct"].shift(-3) > 0).astype(int).iloc[:-3]
+
+    params = params or dict(
+        objective="binary",
+        learning_rate=0.05,
+        num_leaves=31,
+        max_depth=-1,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        n_estimators=400,
+        seed=42,
+    )
+    return lgb.LGBMClassifier(**params).fit(X, y)
+
+def predict_lgbm(model, row: pd.Series) -> float:
+    return float(model.predict_proba(_fe(pd.DataFrame([row])).iloc[:1])[0, 1])
+
+# ----------------------------------------------------------------------
+# 2.  Fast micro‑grid ARIMA  (exogenous sentiment)
+# ----------------------------------------------------------------------
 from statsmodels.tsa.arima.model import ARIMA
 
+_CANDS: List[tuple[int, int, int]] = [
+    (1, 0, 0), (2, 0, 0), (1, 0, 1), (2, 0, 1),
+    (0, 0, 1), (0, 1, 1), (1, 1, 0),
+]
+_MAX_ROWS = 1_000      # constant runtime
+
+def _fit_one(order, y, ex):
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        mdl = ARIMA(
+            y, exog=ex, order=order,
+            trend="n",
+            enforce_stationarity=False,
+            enforce_invertibility=False,
+        ).fit(method_kwargs={"maxiter": 40})
+    return order, mdl.aic, mdl
 
 def train_arima(df: pd.DataFrame):
-    """
-    Fit ARIMA(1,0,0) on daily returns with sentiment as exogenous.
-    We forecast next-day % return.
-    """
-    exog = df["sentiment"]
-    endog = df["ret_pct"]
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        model = ARIMA(endog, order=(1, 0, 0), exog=exog).fit()
-    return model
+    y = df["ret_pct"].astype(float)
+    ex = df[["sentiment"]].astype(float)
+    if len(df) > _MAX_ROWS:
+        y, ex = y.iloc[-_MAX_ROWS:], ex.iloc[-_MAX_ROWS:]
 
+    res = joblib.Parallel(n_jobs=-1)(
+        joblib.delayed(_fit_one)(o, y, ex) for o in _CANDS
+    )
+    return min(res, key=lambda t: t[1])[2]
 
 def forecast_arima(model, next_sent: float) -> float:
-    """One-step forecast of % return given exogenous sentiment value."""
-    fc = model.forecast(steps=1, exog=[next_sent])
-    return float(fc.iloc[0])
+    return float(model.forecast(steps=1, exog=[[next_sent]]).iloc[0])
 
-
-# ------------------------------------------------------------------
-# 3. Prophet with sentiment regressor
-# ------------------------------------------------------------------
+# ----------------------------------------------------------------------
+# 3.  Prophet  (sentiment regressor, row‑capped)
+# ----------------------------------------------------------------------
 try:
     from prophet import Prophet
-    _PROPHET_AVAILABLE = True
+    _PROPHET = True
 except ModuleNotFoundError:
-    _PROPHET_AVAILABLE = False
+    _PROPHET = False
 
+_MAX_PR_ROWS = 1_200    # ≈ 5y of trading days
 
-def train_prophet(df: pd.DataFrame):
-    """
-    Fit a **Prophet** model on daily returns (column ``ret_pct`` renamed to
-    ``y``) with **sentiment** as an extra regressor.
+@st.cache_data(show_spinner=False,
+               hash_funcs={pd.DataFrame: lambda d: (len(d), d.index[-1])})
+def train_prophet(
+    df: pd.DataFrame,
+    weekly_order: int = 3,
+    yearly_order: int = 10,
+) -> Prophet:
+    if not _PROPHET:
+        raise ImportError("prophet not installed; `pip install prophet`")
 
-    Seasonality
-    -----------
-    * ``weekly_seasonality=True`` – default weekly term (Fourier order = 3)
-    * ``yearly_seasonality=True`` – default yearly term  (Fourier order = 10)
+    d = df.tail(_MAX_PR_ROWS).copy()
+    d["ds"] = d.index
+    d["y"]  = d["ret_pct"].astype(float)
+    d["sentiment"] = d["sentiment"].astype(float)
 
-    We *do not* add a second custom ``"weekly"`` component to avoid duplicate
-    names/warnings – one weekly term is normally sufficient for equities.
-
-    Parameters
-    ----------
-    df : DataFrame
-        Must contain an index that is a DatetimeIndex plus columns
-        ``sentiment`` and ``ret_pct``.
-
-    Returns
-    -------
-    prophet.Prophet
-        Fitted model ready for one-step-ahead forecasting.
-    """
-    if not _PROPHET_AVAILABLE:
-        raise ImportError("prophet not installed.  `pip install prophet`")
-
-    # --- build Prophet-friendly dataframe -------------------------
-    dff = df.copy()
-    dff["ds"] = dff.index               # always create the date column
-    dff = dff.reset_index(drop=True)
-    dff = dff.rename(columns={"ret_pct": "y"})
-    dff["sentiment"] = dff["sentiment"].astype(float)
-
-    # --- train ----------------------------------------------------
     m = Prophet(
         daily_seasonality=False,
-        weekly_seasonality=True,
-        yearly_seasonality=True
+        weekly_seasonality=False,
+        yearly_seasonality=False,
+        seasonality_mode="multiplicative",
+        changepoint_range=0.90,
     )
     m.add_regressor("sentiment")
+    m.add_seasonality("weekly", period=7,     fourier_order=weekly_order)
+    m.add_seasonality("yearly", period=365.25, fourier_order=yearly_order)
 
-
-    # Prophet complains about pandas warnings; silence them
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        m.fit(dff[["ds", "y", "sentiment"]])
+        m.fit(d[["ds", "y", "sentiment"]])
 
     return m
-def forecast_prophet(model, next_date: pd.Timestamp, next_sent: float) -> float:
-    """
-    One-step forecast of **next-day percent return** using the fitted Prophet
-    model.
 
-    Dashboard mapping
-    -----------------
-    In *app.py* the slider labelled **“Probability / forecast threshold”**
-    covers 0.50 → 0.90.
-    We convert it to a symmetric return threshold::
-
-        ret_thresh = (slider - 0.50) / 10        # ≈  ±0.02 … ±0.04
-
-    * If ``forecast >  ret_thresh``  → long entry signal
-    * If ``forecast < -ret_thresh``  → flat / exit
-
-    Parameters
-    ----------
-    model : prophet.Prophet
-    next_date : Timestamp
-        The date we want to forecast (usually *today + 1 business day*).
-    next_sent : float
-        The accompanying Reddit-sentiment value to feed as exogenous regressor.
-
-    Returns
-    -------
-    float
-        Forecasted **percent price change** for that day.
-    """
-    df_future = pd.DataFrame({"ds": [next_date], "sentiment": [next_sent]})
-    fc = model.predict(df_future)
+def forecast_prophet(model: Prophet, next_date, next_sent: float) -> float:
+    fc = model.predict(pd.DataFrame({"ds": [next_date], "sentiment": [next_sent]}))
     return float(fc["yhat"].iloc[0])

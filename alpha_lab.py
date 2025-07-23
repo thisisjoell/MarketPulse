@@ -11,8 +11,9 @@ show_results(equity_df, trades_df) -> None   # renders in Streamlit
 """
 
 from __future__ import annotations
+from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode
 import numpy as np
-import talib as ta
+import ta
 from itertools import product
 import pandas as pd
 import plotly.express as px
@@ -26,20 +27,39 @@ _TS_SPLIT = TimeSeriesSplit(n_splits=5)          # 5 expanding folds
 # 1. Merge price & sentiment (daily)
 # ------------------------------------------------------------------
 def merge_price_sentiment(
-    price_daily: pd.Series,
+    price_daily: pd.Series | pd.DataFrame,
     trend_df: pd.DataFrame,
 ) -> pd.DataFrame:
-    """
-    Return DataFrame with columns:
-        price, sentiment, ret_pct
-    Missing sentiment forward/back-filled.
-    """
-    df = (
-        pd.DataFrame({"price": price_daily})
-        .join(trend_df.set_index("day")["sentiment"], how="left")
-        .fillna(method="ffill")
-        .fillna(method="bfill")
-    )
+    import pandas as pd
+    import numpy as np
+
+    # Build price DataFrame
+    if isinstance(price_daily, pd.DataFrame):
+        if "Close" in price_daily.columns and price_daily.shape[1] == 1:
+            df = price_daily.rename(columns={"Close": "price"})
+        elif price_daily.shape[1] == 1:
+            df = price_daily.rename(columns={price_daily.columns[0]: "price"})
+        else:
+            raise ValueError("price_daily DataFrame must have a single column.")
+    else:
+        df = price_daily.to_frame(name="price")
+
+    # Try to ensure 'day' is present in trend_df
+    if not trend_df.empty:
+        if "day" not in trend_df.columns:
+            # Try to use index as 'day'
+            trend_df = trend_df.copy()
+            trend_df["day"] = trend_df.index
+        if "sentiment" not in trend_df.columns:
+            raise ValueError("trend_df must have a 'sentiment' column.")
+        sentiment = trend_df.set_index("day")["sentiment"]
+        df = df.join(sentiment, how="left")
+        df = df.ffill().bfill()
+        df["sentiment"] = df["sentiment"].fillna(0.0)  # fill any remaining gaps
+    else:
+        # Trend is empty: default to neutral sentiment (0.0)
+        df["sentiment"] = 0.0
+
     df["ret_pct"] = df["price"].pct_change().fillna(0)
     return df
 
@@ -56,76 +76,98 @@ def run_manual_strategy(
     price_drop_pct: float,
     price_rise_pct: float,
     stop_loss_pct: float = 0.0,
-    tx_cost_bps:  float = 0.0,          # ← NEW: one-way cost, e.g. 5 = 0.05 %
+    tx_cost_bps:  float = 0.0,
     initial_cap:  float = 1_000,
     vol_thresh:   float = 0.02,
     mom_thresh:   float = 0.01,
-    rsi_max: float = 30,  # NEW – oversold
-    macd_req: bool = False,  # NEW – bool flag
+    rsi_max: float = 30,
+    macd_req: bool = False,
 ):
     """
-    Long-only toy strategy.
-
-    Entry (next open) when **all** are true
-    --------------------------------------
-    • sentiment_{t-1} > sent_threshold
-    • return_t       ≤ −price_drop_pct
-    • vol_10         >  vol_thresh          (volatility spike)
-    • mom_5          < −mom_thresh          (bear momentum)
-
-    Exit when
-    ---------
-    • sentiment_{t-1} < 0   OR
-    • return_t       ≥  price_rise_pct  OR
-    • trailing stop-loss triggered.
+    Runs a long-only trading strategy with multi-factor entry and exit logic.
 
     Parameters
     ----------
-    tx_cost_bps : float
-        One-way transaction cost in basis-points (1 bp = 0.01 %).
+    df : pd.DataFrame
+        DataFrame with price, sentiment, and indicator columns (output of `add_factors`).
+    sent_threshold : float
+        Sentiment threshold for entry.
+    price_drop_pct : float
+        Minimum negative return (in percent) to trigger entry.
+    price_rise_pct : float
+        Positive return threshold for exit.
+    stop_loss_pct : float, optional
+        Trailing stop-loss (as a fraction, e.g. 0.02 for 2%).
+    tx_cost_bps : float, optional
+        One-way transaction cost in basis points (1 bp = 0.01%).
+    initial_cap : float, optional
+        Starting capital for the backtest.
+    vol_thresh, mom_thresh, rsi_max, macd_req: floats/bool
+        Additional indicator thresholds for entry.
+
+    Returns
+    -------
+    df_bt : pd.DataFrame
+        Copy of input DataFrame with columns:
+            - 'equity': Strategy account value after each step.
+            - 'bh_equity': Buy-and-hold equity curve.
+            - 'random_equity': Random strategy baseline.
+
+        **The equity curve always matches the DataFrame's index and length**.
+        The first value is initial_cap; subsequent values reflect cash+position after each step.
+
+    trades_df : pd.DataFrame
+        DataFrame of executed trades with entry/exit details.
     """
-    df  = add_factors(df)                       # enrich with vol_10, mom_5 …
-    bps = tx_cost_bps / 10_000                  # convert → proportion
+    # --- Defensive: handle short DataFrames (0 or 1 row) ---
+    if len(df) < 2:
+        df_bt = df.copy()
+        df_bt["equity"] = [initial_cap] * len(df_bt)
+        df_bt["bh_equity"] = initial_cap * (df_bt["price"] / df_bt["price"].iloc[0])
+        df_bt["random_equity"] = initial_cap
+        trades_df = pd.DataFrame(columns=["entry_dt", "exit_dt", "entry_px", "exit_px", "pl_pct"])
+        return df_bt, trades_df
+
+    # Normal logic (now always runs on at least 2 rows)
+    df  = add_factors(df)
+    bps = tx_cost_bps / 10_000
 
     cash, pos = initial_cap, 0.0
-    entry_px   = None
-    equity_curve, trades = [], []
+    entry_px = None
+    equity_curve, trades = [initial_cap], []
 
     for i in range(1, len(df)):
         row_prev, row = df.iloc[i - 1], df.iloc[i]
         date_idx = row.name
 
         entry_sig = (
-                (row_prev["sentiment"] > sent_threshold) and
-                (row["ret_pct"] <= -price_drop_pct) and
-                (row["vol_10"] > vol_thresh) and
-                (row["mom_5"] < -mom_thresh) and
-                (row["rsi_14"] < rsi_max) and  # ▶ RSI filter
-                (not macd_req or row["macd_hist"] > 0) and  # ▶ MACD bullish hist
-                (row["bb_perc"] < 0.15)  # ▶ price near lower band
+            (row_prev["sentiment"] > sent_threshold) and
+            (row["ret_pct"] <= -price_drop_pct) and
+            (row["vol_10"] > vol_thresh) and
+            (row["mom_5"] < -mom_thresh) and
+            (row["rsi_14"] < rsi_max) and
+            (not macd_req or row["macd_hist"] > 0) and
+            (row["bb_perc"] < 0.15)
         )
 
         exit_sig = (
             pos > 0 and (
-                (row_prev["sentiment"] < 0)            or
-                (row["ret_pct"]        >= price_rise_pct) or
+                (row_prev["sentiment"] < 0) or
+                (row["ret_pct"] >= price_rise_pct) or
                 (stop_loss_pct and row["price"] < entry_px * (1 - stop_loss_pct))
             )
         )
 
-        # -------- execute --------
         if entry_sig and cash > 0:
-            # pay cost on entry
-            pos  = (cash * (1 - bps)) / row["price"]
+            pos = (cash * (1 - bps)) / row["price"]
             entry_px = row["price"]
             cash = 0
             trades.append(
                 dict(entry_dt=date_idx, entry_px=entry_px,
-                     exit_dt=np.nan,     exit_px=np.nan,  pl_pct=np.nan)
+                     exit_dt=np.nan, exit_px=np.nan, pl_pct=np.nan)
             )
 
         elif exit_sig:
-            # pay cost on exit
             cash = pos * row["price"] * (1 - bps)
             trades[-1]["exit_dt"] = date_idx
             trades[-1]["exit_px"] = row["price"]
@@ -134,10 +176,10 @@ def run_manual_strategy(
 
         equity_curve.append(cash + pos * row["price"])
 
-    # ---------- wrap-up ----------
-    df_bt = df.iloc[1:].copy()
-    df_bt["equity"] = equity_curve
+    df_bt = df.copy()
+    assert len(equity_curve) == len(df_bt), "Equity curve and DataFrame must be same length"
 
+    df_bt["equity"] = equity_curve
     df_bt["bh_equity"] = initial_cap * (df_bt["price"] / df_bt["price"].iloc[0])
 
     rng = np.random.default_rng(42)
@@ -151,6 +193,8 @@ def run_manual_strategy(
         columns=["entry_dt", "exit_dt", "entry_px", "exit_px", "pl_pct"]
     )
     return df_bt, trades_df
+
+
 
 
 
@@ -176,16 +220,29 @@ def _sharpe(ret_series: pd.Series, risk_free: float = 0.0) -> float:
 # ---------------------------------------------------------------
 # helper – execute a pre-computed Boolean entry signal
 # ---------------------------------------------------------------
-def _exec_signal(df: pd.DataFrame,
-                 signal: pd.Series,
-                 initial_cap: float = 1_000):
+def _exec_signal(
+    df: pd.DataFrame,
+    signal: pd.Series,
+    initial_cap: float = 1_000,
+    tx_cost_bps: float = 0.0,          # ← NEW: cost per side (1 bp = 0.01 %)
+):
     """
-    Convert a True/False entry signal into trades + equity curve.
+    Convert a Boolean entry signal into equity & trade log, **including
+    transaction costs** on every entry and exit.
+
+    Parameters
+    ----------
+    df            : DataFrame with at least a 'price' column.
+    signal        : Series[bool] – True means “hold long” for that day.
+    initial_cap   : Starting capital in dollars.
+    tx_cost_bps   : One‑way cost in basis‑points (e.g. 5 = 0.05 %).
+
     Returns
     -------
-    eq_df   : DataFrame with equity, bh_equity, random_equity
-    trades  : DataFrame (may be empty) with the 5 standard columns
+    eq_df   : DataFrame with equity, bh_equity, random_equity.
+    trades  : DataFrame (may be empty) with the 5 standard columns.
     """
+    bps  = tx_cost_bps / 10_000        # convert → proportion
     cash, pos = initial_cap, 0.0
     entry_px = None
     equity, trades = [], []
@@ -198,16 +255,18 @@ def _exec_signal(df: pd.DataFrame,
         exit_ = (not signal.iloc[i - 1]) and pos > 0
 
         if enter:
-            pos = cash / row["price"]
+            # pay cost on entry
+            pos = (cash * (1 - bps)) / row["price"]
             entry_px = row["price"]
             cash = 0
             trades.append(
                 {"entry_dt": date_idx, "entry_px": entry_px,
-                 "exit_dt": np.nan,     "exit_px": np.nan, "pl_pct":np.nan}
+                 "exit_dt": np.nan, "exit_px": np.nan, "pl_pct": np.nan}
             )
 
         elif exit_:
-            cash = pos * row["price"]
+            # pay cost on exit
+            cash = pos * row["price"] * (1 - bps)
             trades[-1].update(
                 exit_dt=date_idx,
                 exit_px=row["price"],
@@ -217,44 +276,106 @@ def _exec_signal(df: pd.DataFrame,
 
         equity.append(cash + pos * row["price"])
 
+    # -------- wrap‑up --------
     eq_df = df.iloc[1:].copy()
-    eq_df["equity"]        = equity
-    eq_df["bh_equity"]     = initial_cap * (eq_df["price"] / eq_df["price"].iloc[0])
+    eq_df["equity"] = equity
+    eq_df["bh_equity"] = initial_cap * (eq_df["price"] / eq_df["price"].iloc[0])
+
     rng = np.random.default_rng(42)
     rand = rng.integers(0, 2, len(eq_df))
     eq_df["random_equity"] = initial_cap * ((1 + eq_df["ret_pct"] * rand).cumprod())
 
-    # —— guarantee the columns even when *no* trade fired ——
+    # guarantee columns even if no trades
     trades_df = pd.DataFrame(
-        trades,
-        columns=["entry_dt", "exit_dt", "entry_px", "exit_px", "pl_pct"]
+        trades, columns=["entry_dt", "exit_dt", "entry_px", "exit_px", "pl_pct"]
     )
 
     return eq_df, trades_df
-def run_model_strategy_bayes(df: pd.DataFrame,
-                             model,
-                             prob_thresh: float = 0.70,
-                             initial_cap: float = 1_000):
-    # compute engineered features row-wise
+def run_model_strategy_bayes(
+    df: pd.DataFrame,
+    model,
+    prob_thresh: float = 0.70,
+    initial_cap: float = 1_000,
+    tx_cost_bps=0.0
+):
+    """
+    Logistic‑regression (Bayes tab) strategy.
+    Uses calibrated P(up) from model.predict_proba().
+    """
+    # 1‑step‑ahead engineered features
     feats = models._feature_engineering(df)
-    probs = model.predict(feats)
-    probs = 1 / (1 + np.exp(-probs))        # logistic
-    sig = pd.Series(probs, index=df.index) > prob_thresh
-    return _exec_signal(df, sig, initial_cap)
-def run_model_strategy_arima(df: pd.DataFrame,
-                             model,
-                             ret_thresh: float = 0.02,
-                             initial_cap: float = 1_000):
-    fc = model.forecast(steps=len(df), exog=df["sentiment"])
-    entry_signal = fc > ret_thresh                 # long bias if forecast > +2 %
-    return _exec_signal(df, entry_signal, initial_cap)
-def run_model_strategy_prophet(df, model, next_date, ret_thresh=0.02, initial_cap=1_000):
-    # generate one-step-ahead rolling forecast
-    fc = []
-    for i in range(len(df)):
-        fc.append(models.forecast_prophet(model, df.index[i], df["sentiment"].iloc[i]))
-    signal = pd.Series(fc, index=df.index) > ret_thresh
-    return _exec_signal(df, signal, initial_cap)
+    # column  = probability that next‑day return > 0
+    probs = model.predict_proba(feats)[:, 1]
+    entry_signal = pd.Series(probs, index=df.index) > prob_thresh
+    return _exec_signal(df, entry_signal, initial_cap, tx_cost_bps)
+def run_model_strategy_arima(
+    df: pd.DataFrame,
+    model,
+    ret_thresh: float = 0.02,
+    initial_cap: float = 1_000,
+    tx_cost_bps=0.0
+):
+    """
+    ARIMA(1,0,0)+sentiment strategy (no look‑ahead).
+
+    * Uses in‑sample one‑step forecasts that share df.index
+    * Works on statsmodels 0.12 -> 0.15+
+    """
+    # --------------------------------------------------------------
+    # Older statsmodels (<0.14) needs `typ="levels"` or the result
+    # is in log‑terms. Passing it on >=0.14 is harmless
+    # --------------------------------------------------------------
+    fc = model.predict(
+        start=0,
+        end=len(df) - 1,
+        exog=df["sentiment"],
+        typ="levels",          # <‑‑ compatibility flag
+    )
+
+    fc = pd.Series(fc.values, index=df.index)
+
+    # trade on *yesterday’s* forecast
+    entry_signal = fc.shift(1) > ret_thresh
+    entry_signal.iloc[0] = False      # first day cannot trade
+
+    return _exec_signal(df, entry_signal, initial_cap, tx_cost_bps)
+
+def run_model_strategy_prophet(
+    df: pd.DataFrame,
+    ret_thresh: float = 0.02,
+    initial_cap: float = 1_000,
+    tx_cost_bps: float = 0.0,
+    warmup: int = 120,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Expanding‑window walk‑forward Prophet strategy.
+
+    Re‑fits Prophet each day on data ≤ t‑1 and trades on the forecast
+    for day t‑1 (shifted so there’s no look‑ahead).
+    """
+    if len(df) <= warmup:
+        raise ValueError("Not enough data for walk‑forward Prophet.")
+
+    fc_vals = [np.nan] * len(df)
+    for i in range(warmup, len(df)):
+        train = df.iloc[:i]
+        mdl   = models.train_prophet(train)
+        fc_vals[i] = models.forecast_prophet(
+            mdl,
+            next_date=df.index[i],
+            next_sent=float(df["sentiment"].iloc[i]),
+        )
+
+    # build yesterday’s signal
+    entry_signal = (
+        pd.Series(fc_vals, index=df.index)
+          .shift(1)
+          .gt(ret_thresh)
+    )
+    entry_signal.iloc[: warmup + 1] = False
+
+    return _exec_signal(df, entry_signal, initial_cap, tx_cost_bps)
+
 
 # ------------------------------------------------------------------
 # 5. Walk-forward cross-validation
@@ -314,45 +435,44 @@ def add_factors(df: pd.DataFrame) -> pd.DataFrame:
     """
     Enrich <price, sentiment> frame with common technical factors.
     Adds: vol_10, mom_5, z_20, rsi_14, macd_hist, bb_perc, bb_width.
+    (Pure‑Python implementation with the `ta` library.)
     """
-    out = df.copy()
-    px  = out["price"].values.astype(float)      # numpy view for TA-Lib
+    out   = df.copy()
+    close = out["price"]
 
     # ── basic rolling stats ───────────────────────────────────────
-    out["vol_10"] = out["price"].pct_change().rolling(10).std()
-    out["mom_5"]  = out["price"].pct_change(5)
+    out["vol_10"] = close.pct_change().rolling(10).std()
+    out["mom_5"]  = close.pct_change(5)
 
-    sma20 = out["price"].rolling(20).mean()
-    std20 = out["price"].rolling(20).std()
-    out["z_20"]   = (out["price"] - sma20) / std20
+    sma20 = close.rolling(20).mean()
+    std20 = close.rolling(20).std()
+    out["z_20"]   = (close - sma20) / std20
 
-    # ── TA-Lib indicators ────────────────────────────────────────
-    # 1) RSI-14
-    out["rsi_14"] = ta.RSI(px, timeperiod=14)
+    # ── technical indicators (ta) ─────────────────────────────────
+    out["rsi_14"]    = ta.momentum.rsi(close, window=14)
 
-    # 2) MACD histogram (12,26,9)
-    macd, macd_sig, macd_hist = ta.MACD(px, fastperiod=12,
-                                            slowperiod=26,
-                                            signalperiod=9)
-    out["macd_hist"] = macd_hist
+    # MACD histogram (fast 12, slow 26, signal 9)
+    out["macd_hist"] = ta.trend.macd_diff(
+        close,
+        window_slow=26, window_fast=12, window_sign=9
+    )
 
-    # 3) Bollinger Bands (20, 2 σ)
-    upper, middle, lower = ta.BBANDS(px, timeperiod=20,
-                                          nbdevup=2, nbdevdn=2)
-    out["bb_low"]   = lower
-    out["bb_high"]  = upper
+    # Bollinger Bands 20‑period ±2 σ
+    bb_high = ta.volatility.bollinger_hband(close, window=20, window_dev=2)
+    bb_low  = ta.volatility.bollinger_lband(close, window=20, window_dev=2)
+    width   = bb_high - bb_low
 
-    width           = upper - lower
-    out["bb_perc"]  = (px - lower) / width
+    out["bb_low"]   = bb_low
+    out["bb_high"]  = bb_high
+    out["bb_perc"]  = (close - bb_low) / width
     out["bb_width"] = width / sma20
 
     # ── housekeeping ─────────────────────────────────────────────
-    out["bb_perc"] = out["bb_perc"].clip(-0.1, 1.0)   # flat-market safeguard
+    out["bb_perc"] = out["bb_perc"].clip(-0.1, 1.0)   # flat‑market safeguard
     out.replace([np.inf, -np.inf], np.nan, inplace=True)
-    out.bfill(inplace=True)                           # fill first 19 NaNs
+    out.bfill(inplace=True)                           # fill initial NaNs
 
     return out
-
 def grid_search(
     df: pd.DataFrame,
     param_grid: dict,
@@ -453,16 +573,40 @@ def corr_matrix(price_map: dict[str, pd.Series]) -> pd.DataFrame:
     return ret.corr()                           # Pearson by default
 
 
-def rolling_corr_pair(a: pd.Series,
-                      b: pd.Series,
-                      win: int = 30) -> pd.Series:
+def rolling_corr_pair(a: pd.Series, b: pd.Series, win: int = 30) -> pd.Series:
     """
-    30-day rolling correlation of two return series.
-    Index = original DatetimeIndex aligned on **both** series.
+    Compute rolling window correlation of the daily returns of two price series.
+    Output index matches input index after .pct_change().dropna() alignment.
+    Returns empty Series if not enough data.
     """
-    df = pd.concat({"a": a, "b": b}, axis=1).pct_change().dropna()
-    return df["a"].rolling(win).corr(df["b"])
+    import pandas as pd
 
+    # Flatten input to 1D Series if passed as 1-column DataFrame
+    if isinstance(a, pd.DataFrame) and a.shape[1] == 1:
+        a = a.iloc[:, 0]
+    if isinstance(b, pd.DataFrame) and b.shape[1] == 1:
+        b = b.iloc[:, 0]
+
+    # Now always Series
+    a = pd.Series(a)
+    b = pd.Series(b)
+    # Align series on shared index
+    a, b = a.align(b, join='inner')
+
+    if len(a) < 2 or len(b) < 2 or a.isnull().all() or b.isnull().all():
+        return pd.Series(dtype=float, index=a.index)
+
+    a_ret = a.pct_change()
+    b_ret = b.pct_change()
+    if a_ret.isnull().all() or b_ret.isnull().all():
+        return pd.Series(dtype=float, index=a.index)
+
+    returns = pd.DataFrame({"a": a_ret, "b": b_ret}).dropna()
+    if returns.empty or len(returns) < win:
+        return pd.Series(dtype=float, index=returns.index)
+
+    rho = returns["a"].rolling(win, min_periods=win).corr(returns["b"])
+    return rho
 
 def plot_corr_heat(corr_df: pd.DataFrame):
     """Nice heat-map with Plotly."""
@@ -478,29 +622,38 @@ def plot_corr_heat(corr_df: pd.DataFrame):
 
 
 def plot_rolling_corr(rho: pd.Series, symA: str, symB: str):
-    fig = px.line(rho, title=f"30-day rolling ρ: {symA} vs {symB}",
-                  labels={"value": "Correlation", "index": "Date"})
+    # ── new: give the Series a proper label for Plotly ───────────────────
+    rho = rho.copy()                       # make it writable
+    rho.name = f"{symA}–{symB}"            # legend / hover label
+    # --------------------------------------------------------------------
+
+    fig = px.line(
+        rho,
+        title=f"30‑day rolling ρ: {symA} vs {symB}",
+        labels={"value": "Correlation", "index": "Date"},
+    )
     fig.add_hline(0, line_dash="dash", line_color="grey")
     st.plotly_chart(fig, use_container_width=True)
 # ------------------------------------------------------------------
 # 7. Streamlit display
 # ------------------------------------------------------------------
 def show_results(equity_df: pd.DataFrame, trades_df: pd.DataFrame):
+    """Render strategy performance metrics, equity curves, and interactive trade log."""
     st.subheader("📈 Strategy Performance")
 
-    # --- headline metrics ---
+    # --- headline metrics ---------------------------------------------------
     tot_ret = equity_df["equity"].iloc[-1] / equity_df["equity"].iloc[0] - 1
-    cagr = (1 + tot_ret) ** (252 / len(equity_df)) - 1
-    mdd = _max_drawdown(equity_df["equity"])
-    sharpe = _sharpe(equity_df["equity"].pct_change().dropna())
+    cagr    = (1 + tot_ret) ** (252 / len(equity_df)) - 1
+    mdd     = _max_drawdown(equity_df["equity"])
+    sharpe  = _sharpe(equity_df["equity"].pct_change().dropna())
 
     colA, colB, colC, colD = st.columns(4)
-    colA.metric("Total return", f"{tot_ret*100:.1f}%")
-    colB.metric("CAGR", f"{cagr*100:.1f}%")
-    colC.metric("Max draw-down", f"{mdd*100:.1f}%")
-    colD.metric("Sharpe", f"{sharpe:.2f}")
+    colA.metric("Total return",   f"{tot_ret*100:.1f}%")
+    colB.metric("CAGR",           f"{cagr*100:.1f}%")
+    colC.metric("Max draw-down",  f"{mdd*100:.1f}%")
+    colD.metric("Sharpe",         f"{sharpe:.2f}")
 
-    # --- equity curves ---
+    # --- equity curves ------------------------------------------------------
     fig = px.line(
         equity_df[["equity", "bh_equity", "random_equity"]],
         title="Cumulative equity vs benchmarks",
@@ -508,19 +661,39 @@ def show_results(equity_df: pd.DataFrame, trades_df: pd.DataFrame):
     )
     st.plotly_chart(fig, use_container_width=True)
 
-    # --- trade log ---
+    # --- trade log ----------------------------------------------------------
     st.subheader("📜 Trade log")
-    # Coerce pl_pct to numeric once, then drop / format
-    trades_df["pl_pct"] = pd.to_numeric(trades_df["pl_pct"], errors="coerce")
 
+    # Make a working copy; ensure numeric P/L and drop still-open trades
+    trades_df = trades_df.copy()
+    trades_df["pl_pct"] = pd.to_numeric(trades_df["pl_pct"], errors="coerce")
     trades_df_disp = trades_df.dropna(subset=["pl_pct"]).copy()
+
     if trades_df_disp.empty:
         st.info("No trades executed for the selected rules.")
         return
 
+    # Display P/L in %
     trades_df_disp["pl_pct"] = (trades_df_disp["pl_pct"] * 100).round(2)
-    st.dataframe(trades_df_disp, use_container_width=True, hide_index=True)
 
+    # Interactive Ag-Grid table
+    gb = GridOptionsBuilder.from_dataframe(trades_df_disp)
+    gb.configure_default_column(filter=True, sortable=True, resizable=True)
+    gb.configure_column("pl_pct", header_name="P/L %", type=["numericColumn"], width=90)
+    gb.configure_side_bar()  # optional: columns & filters side panel
+    grid_opts = gb.build()
+
+    AgGrid(
+        trades_df_disp,
+        gridOptions=grid_opts,
+        update_mode=GridUpdateMode.NO_UPDATE,
+        enable_enterprise_modules=False,
+        height=220,
+        fit_columns_on_grid_load=True,
+        theme="streamlit",
+    )
+
+    # --- trade summary stats ------------------------------------------------
     wins = trades_df_disp["pl_pct"] > 0
     win_rate = wins.mean()
     avg_win  = trades_df_disp.loc[wins,  "pl_pct"].mean()
