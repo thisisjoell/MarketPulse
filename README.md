@@ -10,12 +10,10 @@ https://marketpulse-ai.streamlit.app/
 ## Table of Contents
 1. [Why MarketPulse?](#why-marketpulse)  
 2. [Feature Tour](#feature-tour)  
-3. [Under the Hood](#under-the-hood)  
-4. [Model Architectures & Research](#model-architectures--research)  
-5. [Metrics & AB Testing](#metrics--ab-testing)  
-6. [Road‑map](#road-map)  
-7. [Contributing](#contributing)  
-8. [License](#license)  
+3. [Model Architectures & Research](#model-architectures--research)  
+4. [Metrics & AB Testing](#metrics--ab-testing)  
+5. [Road‑map](#road-map)   
+6. [License](#license)  
 
 ---
 
