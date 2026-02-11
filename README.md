@@ -3,7 +3,7 @@
 https://marketpulse-ai.streamlit.app/
 
 > **Real‑time market radar that fuses price action with crowd sentiment to surface actionable divergences and lets you back‑test ideas in seconds – all from a single Streamlit interface.**  
-> “Fetch, visualise, simulate – ship an insight before the bell rings.”
+> Fetch, visualise, simulate – ship an insight before the bell rings.
 
 ---
 
